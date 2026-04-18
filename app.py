@@ -562,20 +562,21 @@ with tab2:
         datos_c = base_cultivos[cultivo_seleccionado]
 
         # Mostrar inputs editables por si el usuario quiere ajustar la base de datos localmente
+        # (Se añaden llaves dinámicas para obligar a Streamlit a actualizar los valores al cambiar de cultivo)
         ck1, ck2, ck3, ck4 = st.columns(4)
         with ck1:
-            kc_ini = st.number_input("Kc Inicial", value=datos_c["kc_ini"], step=0.05, key="kc_i")
-            L_ini = st.number_input("Dur. Inicial (Décadas)", value=datos_c["L_ini"], min_value=1, key="l_i")
+            kc_ini = st.number_input("Kc Inicial", value=float(datos_c["kc_ini"]), step=0.05, key=f"kci_{cultivo_seleccionado}")
+            L_ini = st.number_input("Dur. Inicial (Décadas)", value=int(datos_c["L_ini"]), min_value=1, key=f"li_{cultivo_seleccionado}")
         with ck2:
-            kc_mid = st.number_input("Kc Medio", value=datos_c["kc_mid"], step=0.05, key="kc_m")
-            L_dev = st.number_input("Dur. Desarrollo", value=datos_c["L_dev"], min_value=1, key="l_d")
+            kc_mid = st.number_input("Kc Medio", value=float(datos_c["kc_mid"]), step=0.05, key=f"kcm_{cultivo_seleccionado}")
+            L_dev = st.number_input("Dur. Desarrollo", value=int(datos_c["L_dev"]), min_value=1, key=f"ld_{cultivo_seleccionado}")
         with ck3:
-            kc_end = st.number_input("Kc Final", value=datos_c["kc_end"], step=0.05, key="kc_f")
-            L_mid = st.number_input("Dur. Media", value=datos_c["L_mid"], min_value=1, key="l_m")
+            kc_end = st.number_input("Kc Final", value=float(datos_c["kc_end"]), step=0.05, key=f"kcf_{cultivo_seleccionado}")
+            L_mid = st.number_input("Dur. Media", value=int(datos_c["L_mid"]), min_value=1, key=f"lm_{cultivo_seleccionado}")
         with ck4:
             st.write("") # Espaciador
             st.write("")
-            L_late = st.number_input("Dur. Final (Maduración)", value=datos_c["L_late"], min_value=1, key="l_l")
+            L_late = st.number_input("Dur. Final (Maduración)", value=int(datos_c["L_late"]), min_value=1, key=f"ll_{cultivo_seleccionado}")
 
         duracion_total = int(L_ini + L_dev + L_mid + L_late)
         

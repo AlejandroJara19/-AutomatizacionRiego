@@ -628,7 +628,237 @@ with tab2:
         with ce2: pct_sustrato = st.number_input("% Sustrato", value=100.0, step=5.0, min_value=0.0, max_value=100.0, key="p_sus")
         with ce3: ef_cond = st.number_input("% Ef. Cond", value=98.0, step=1.0, min_value=0.0, max_value=100.0, key="ef_c")
         with ce4: ef_dist = st.number_input("% Ef. Dist", value=98.0, step=1.0, min_value=0.0, max_value=100.0, key="ef_d")
-        with ce5: ef_rieg = st.number_input("% Ef. Riego", value=90.0, step=1.0, min_value=0.0, max_value=100.0
+        with ce5: ef_rieg = st.number_input("% Ef. Riego", value=90.0, step=1.0, min_value=0.0, max_value=100.0, key="ef_r")
+
+        if 'calcular_t2' not in st.session_state: st.session_state['calcular_t2'] = False
+        if st.button("Calcular Diseño Paso a Paso", type="primary", key="btn_calc_t2_run"): st.session_state['calcular_t2'] = True
+
+        if st.session_state['calcular_t2']:
+            with st.spinner('Procesando datos hídricos, agronómicos e hidráulicos... 🚀'):
+                try:
+                    import folium
+                    import streamlit.components.v1 as components
+
+                    # --- MAPA SATELITAL (DEPARTAMENTO Y MUNICIPIO) ---
+                    st.divider()
+                    st.subheader("🌍 Ubicación del Proyecto")
+                    m = folium.Map(location=[lat_input, lon_input], zoom_start=9)
+                    folium.TileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', attr='Esri', name='Esri Satellite').add_to(m)
+                    folium.Marker([lat_input, lon_input], tooltip="Punto de Proyecto").add_to(m)
+                    
+                    try:
+                        import time
+                        headers = {'User-Agent': 'HidroApp_SIG_Project/1.0'}
+                        
+                        # Polígono del Departamento (Zoom 5)
+                        url_dep = f"https://nominatim.openstreetmap.org/reverse?lat={lat_input}&lon={lon_input}&format=json&polygon_geojson=1&zoom=5"
+                        res_dep = requests.get(url_dep, headers=headers)
+                        if res_dep.status_code == 200:
+                            data_dep = res_dep.json()
+                            if 'geojson' in data_dep and data_dep['geojson']['type'] in ['Polygon', 'MultiPolygon']:
+                                folium.GeoJson(
+                                    data_dep['geojson'], 
+                                    style_function=lambda x: {'fillColor': '#FFA500', 'color': '#FF8C00', 'weight': 2, 'fillOpacity': 0.1}, 
+                                    tooltip=f"Departamento: {data_dep.get('name', 'N/A')}"
+                                ).add_to(m)
+                        
+                        time.sleep(1.5) # Pausa para no saturar la API
+                        
+                        # Polígono del Municipio (Zoom 10)
+                        url_mun = f"https://nominatim.openstreetmap.org/reverse?lat={lat_input}&lon={lon_input}&format=json&polygon_geojson=1&zoom=10"
+                        res_mun = requests.get(url_mun, headers=headers)
+                        if res_mun.status_code == 200:
+                            data_mun = res_mun.json()
+                            if 'geojson' in data_mun and data_mun['geojson']['type'] in ['Polygon', 'MultiPolygon']:
+                                folium.GeoJson(
+                                    data_mun['geojson'], 
+                                    style_function=lambda x: {'fillColor': '#00FFFF', 'color': '#008B8B', 'weight': 3, 'fillOpacity': 0.35}, 
+                                    tooltip=f"Municipio: {data_mun.get('name', 'N/A')}"
+                                ).add_to(m)
+                    except Exception as e:
+                        st.warning(f"Aviso SIG: No se pudieron cargar los límites políticos automáticos. ({e})")
+                    
+                    components.html(m._repr_html_(), height=400)
+
+                    # --- 1. FUENTE CLIMÁTICA (SESIÓN TAB1 O NASA) ---
+                    usar_sesion_tab1 = (
+                        fuente_clima_t2 == "Usar datos procesados en Pestaña 1"
+                        and 'df_base_diario_tab1' in st.session_state
+                        and st.session_state['df_base_diario_tab1'] is not None
+                        and not st.session_state['df_base_diario_tab1'].empty
+                    )
+
+                    if usar_sesion_tab1:
+                        df_clima_t2 = st.session_state['df_base_diario_tab1'].copy()
+                        if 'Decada_Año' not in df_clima_t2.columns:
+                            df_clima_t2 = agregar_decadas(df_clima_t2)
+                        st.info("Usando serie climática procesada en Pestaña 1 (NASA/WaPOR).")
+                    else:
+                        if fuente_clima_t2 == "Usar datos procesados en Pestaña 1":
+                            st.warning("No hay datos previos válidos en Pestaña 1. Se usará NASA POWER.")
+                        df_clima_t2 = preparar_base_nasa(lat_input, lon_input, fecha_inicio, fecha_fin)
+                        df_clima_t2 = agregar_decadas(df_clima_t2)
+
+                    df_dec_anual = df_clima_t2.groupby(['Año', 'Decada_Año'])[['Precipitacion', 'Evaporacion', 'RET']].sum().reset_index()
+                    df_prom = df_dec_anual.groupby('Decada_Año')[['Evaporacion', 'RET']].mean().reset_index()
+                    
+                    # --- 4. PRECIPITACIÓN AL 75% Y EFECTIVA ---
+                    def p75(s):
+                        if len(s) == 0: 
+                            return 0.0
+                        return np.percentile(s, 25)
+
+                    # Integración decadal
+                    df_prom = pd.merge(df_prom, df_dec_anual.groupby('Decada_Año')['Precipitacion'].apply(p75).reset_index().rename(columns={'Precipitacion': 'Prec_75%'}), on='Decada_Año')
+                    P = df_prom['Prec_75%'].values
+                    
+                    # Cálculo de precipitación efectiva (Fórmula USDA)
+                    df_prom['Prec_Efectiva'] = np.where(P < (250/3), P*((125-0.6*P)/125), (125/3)+0.1*P)
+                    p_efec = df_prom['Prec_Efectiva'].values
+
+                    # --- 5. MATRICES KC Y ÁREA ---
+                    kc_m, area_m = np.zeros((num_sectores, 36)), np.zeros((num_sectores, 36))
+                    
+                    # AQUÍ ESTABA EL ERROR: Ya no usamos dur_ini, usamos la curva interpolada de la sección 2
+                    timeline = []
+                    while len(timeline) < 36:
+                        timeline.extend(curva_kc)
+                        if not sembrar_multiple: 
+                            timeline.extend([0]*(36 - len(timeline)))
+                            break
+                        else: 
+                            timeline.extend([0]*int(descanso))
+                    timeline = timeline[:36] 
+                    
+                    for i in range(num_sectores):
+                        idx = (int(decada_inicio)-1 + i*paso_escalonamiento)%36
+                        for j in range(36):
+                            d_act = (idx + j)%36
+                            kc_m[i, d_act] = timeline[j]
+                            if timeline[j] > 0: 
+                                area_m[i, d_act] = area_total / num_sectores
+
+                    cols_d = [f"D{d}" for d in range(1, 37)]
+                    idx_s = [f"Sector {i+1}" for i in range(num_sectores)]
+                    df_kc, df_area = pd.DataFrame(kc_m, columns=cols_d, index=idx_s), pd.DataFrame(area_m, columns=cols_d, index=idx_s)
+                    
+                    df_ret_matrix = pd.DataFrame([df_prom['RET'].values], columns=cols_d, index=['Clima Base'])
+                    df_pefec_matrix = pd.DataFrame([p_efec], columns=cols_d, index=['Clima Base'])
+
+                    # --- 6. USO CONSUNTIVO Y CAUDALES ---
+                    uso_m, dem_n_m, dem_b_m = np.zeros((num_sectores,36)), np.zeros((num_sectores,36)), np.zeros((num_sectores,36))
+                    t_app_m, q_dem_m, q_dis_m = np.zeros((num_sectores,36)), np.zeros((num_sectores,36)), np.zeros((num_sectores,36))
+                    ef_g = (ef_cond/100)*(ef_dist/100)*(ef_rieg/100)
+                    
+                    # Arreglo de días de la década para cada mes
+                    dias_d = np.array([10,10,11, 10,10,8, 10,10,11, 10,10,10, 10,10,11, 10,10,10, 10,10,11, 10,10,11, 10,10,10, 10,10,11, 10,10,10, 10,10,11])
+                    ret_v = df_prom['RET'].values
+                    
+                    # Pre-cálculo para aspersión: Intensidad de aplicación en mm/hr
+                    intensidad_app = 0
+                    if tipo_riego == "Riego por aspersión":
+                        intensidad_app = caudal_emisor_lh / (10000 / num_aspersores_ha)
+
+                    for i in range(num_sectores):
+                        for j in range(36):
+                            if kc_m[i,j] > 0:
+                                uso_m[i,j] = ret_v[j] * kc_m[i,j] * (pct_sustrato/100) * ((area_sombreada/100) + 0.15*(1 - (area_sombreada/100)))
+                            
+                            diff = uso_m[i,j] - p_efec[j]
+                            dem_n_m[i,j] = diff if diff > 0 else 0
+                            dem_b_m[i,j] = dem_n_m[i,j] / ef_g
+                            
+                            if dem_b_m[i,j] > 0:
+                                # TIEMPO DE APLICACIÓN
+                                if tipo_riego == "Riego por goteo":
+                                    t_app_m[i,j] = (dist_emisores*dist_laterales*(dem_b_m[i,j]/dias_d[j])*num_sectores) / (emisores_planta*caudal_emisor_lh)
+                                else:
+                                    t_app_m[i,j] = dem_b_m[i,j] / (intensidad_app * dias_d[j])
+
+                    t_max = t_app_m.max() if t_app_m.max() > 0 else 1
+                    
+                    # CAUDAL DEMANDADO Y DE DISEÑO
+                    for i in range(num_sectores):
+                        for j in range(36):
+                            if dem_b_m[i,j] > 0:
+                                if tipo_riego == "Riego por goteo":
+                                    q_dem_m[i,j] = ((dem_b_m[i,j]*10*1000)/(t_max*3600)) / dias_d[j]
+                                    q_dis_m[i,j] = q_dem_m[i,j] * area_m[i, j] 
+                                else:
+                                    q_dem_m[i,j] = (num_aspersores_ha * caudal_emisor_lh * area_m[i, j]) / 3600
+                                    q_dis_m[i,j] = (q_dem_m[i,j] * (t_app_m[i,j] / 24)) * (area_total / area_m[i, j])
+
+                    df_uso = pd.DataFrame(uso_m, columns=cols_d, index=idx_s)
+                    df_dn = pd.DataFrame(dem_n_m, columns=cols_d, index=idx_s)
+                    df_db = pd.DataFrame(dem_b_m, columns=cols_d, index=idx_s)
+                    df_t = pd.DataFrame(t_app_m, columns=cols_d, index=idx_s)
+                    df_qd = pd.DataFrame(q_dem_m, columns=cols_d, index=idx_s)
+                    df_qdis = pd.DataFrame(q_dis_m, columns=cols_d, index=idx_s)
+
+                    df_prom['Dem_Neta'] = dem_n_m.max(axis=0)
+                    df_prom['Dem_Bruta'] = dem_b_m.max(axis=0)
+                    df_prom['T_App'] = t_app_m.max(axis=0)
+                    df_prom['Q_Diseno'] = q_dis_m.sum(axis=0) 
+
+                    st.success("✅ Cálculos completados con éxito.")
+
+                    # --- FUNCIONES DE ESTILO VISUAL ---
+                    def color_kc(val): return 'background-color:#d4edda;color:black' if math.isclose(val,kc_ini) else 'background-color:#ffe8cc;color:black' if math.isclose(val,kc_mid) else 'background-color:#f8d7da;color:black' if math.isclose(val,kc_end) else ''
+                    
+                    def resaltar_maximo(df):
+                        max_val = df.max().max()
+                        styles = pd.DataFrame('', index=df.index, columns=df.columns)
+                        if max_val > 0:
+                            styles[df == max_val] = 'background-color: #ff4b4b; color: white; font-weight: bold;'
+                        return styles
+
+                    # --- VISUALIZACIONES EN ACORDEONES ---
+                    st.divider()
+                    st.subheader("🌦️ Paso 1: Matrices Climáticas Base")
+                    with st.expander("Ver Matriz de Evapotranspiración de Referencia - RET (mm/década)"): st.dataframe(df_ret_matrix.style.format("{:.2f}"))
+                    with st.expander("Ver Matriz de Precipitación Efectiva (mm/década)"): st.dataframe(df_pefec_matrix.style.format("{:.2f}"))
+
+                    st.subheader("🌾 Paso 2: Matrices Agronómicas")
+                    with st.expander("Ver Matriz de Coeficiente de Cultivo (Kc)", expanded=True): st.dataframe(df_kc.style.map(color_kc).format("{:.2f}"))
+                    with st.expander("Ver Matriz de Área Sembrada por Sector (Ha)"): st.dataframe(df_area.style.format("{:.2f}"))
+                    with st.expander("Ver Matriz de Uso Consuntivo de la Planta (mm/década)"): st.dataframe(df_uso.style.format("{:.2f}"))
+
+                    st.subheader("💧 Paso 3: Matrices de Diseño Hidráulico")
+                    with st.expander("Ver Matriz de Demanda Neta (mm/década)"): st.dataframe(df_dn.style.format("{:.2f}"))
+                    with st.expander("Ver Matriz de Demanda Bruta (mm/década)"): st.dataframe(df_db.style.format("{:.2f}"))
+                    with st.expander("Ver Matriz de Tiempo de Aplicación (Horas/Día)"): st.dataframe(df_t.style.format("{:.3f}"))
+                    
+                    with st.expander("Ver Matriz de Caudal Demandado (L/s-ha)"): 
+                        st.dataframe(df_qd.style.apply(resaltar_maximo, axis=None).format("{:.3f}"))
+                    with st.expander("Ver Matriz de Caudal de Diseño (L/s)"): 
+                        st.dataframe(df_qdis.style.apply(resaltar_maximo, axis=None).format("{:.3f}"))
+
+                    st.divider()
+                    st.subheader("📊 Gráficas Generales del Sistema")
+                    import plotly.express as px
+                    df_agron = df_prom.melt(id_vars=['Decada_Año'], value_vars=['Prec_Efectiva', 'Dem_Neta', 'Dem_Bruta'], var_name='Variable', value_name='Volumen (mm/década)')
+                    fig_agron = px.line(df_agron, x='Decada_Año', y='Volumen (mm/década)', color='Variable', markers=True, color_discrete_map={'Prec_Efectiva': '#2ca02c', 'Dem_Neta': '#1f77b4', 'Dem_Bruta': '#d62728'}, title="Balance Hídrico (Máximos por década)")
+                    st.plotly_chart(fig_agron, use_container_width=True)
+
+                    st.info(f"⏱️ **Tiempo de aplicación máximo del sistema:** {t_max:.3f} horas/día.\n\n🌊 **Caudal Máximo del Sistema de Bombeo/Captación:** {df_prom['Q_Diseno'].max():.3f} L/s.")
+                    
+                    df_hidro = df_prom.melt(id_vars=['Decada_Año'], value_vars=['Q_Diseno', 'T_App'], var_name='Variable', value_name='Valor')
+                    fig_hidro = px.line(df_hidro, x='Decada_Año', y='Valor', color='Variable', markers=True, title="Comportamiento del Caudal Total y Tiempos de Riego", facet_row='Variable')
+                    fig_hidro.update_yaxes(matches=None)
+                    st.plotly_chart(fig_hidro, use_container_width=True)
+                    
+                    csv = df_prom.round(3).to_csv(index=False, sep=";")
+                    st.download_button("📥 Descargar Tabla General de Promedios y Totales (CSV)", data=csv, file_name=f"Diseno_Completo_{lat_input}_{lon_input}.csv", mime="text/csv", key="btn_down_final_t2")
+                        
+                    st.session_state['df_chrono'] = df_dec_anual
+                    st.session_state['q_diseno_decadal'] = df_prom['Q_Diseno'].values
+                    st.session_state['t_max'] = t_max
+                    st.session_state['area_total_ha'] = area_total
+                    st.session_state['q_diseno'] = q_dis_m 
+
+                except Exception as e:
+                    st.error("Error técnico al procesar el diseño hidráulico.")
+                    st.info(f"Detalle: {e}")
                
                 
 # =====================================================================

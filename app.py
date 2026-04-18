@@ -30,7 +30,13 @@ import requests
 
 # --- GENERACIÓN DE INFORMES (ADR) ---
 from docx import Document
-from docx.shared import Inches, Pt
+from docx.shared import Pt, Inches
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+# --- PRUEBAS (ADR) ---
+import streamlit as st
+import pandas as pd
+import io
 
 # --- CACHÉ / RED ---
 REQUEST_TIMEOUT = 30
@@ -109,6 +115,103 @@ def agregar_decadas(df_base_diario):
     )
     df['Decada_Año'] = (df['Mes'] - 1) * 3 + df['Decada_Mes']
     return df
+
+def crear_memoria_hidrologia(datos_clima, coordenadas, df_simulacion=None, tipo_almacenamiento="No definido", vol_max=0):
+    doc = Document()
+    
+    # Encabezado ADR
+    titulo = doc.add_heading('Anexo 3: Memoria de Cálculo Hidrología y Climatología', 0)
+    titulo.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    # --- Sección 1 a 3 (Se mantienen intactas) ---
+    doc.add_heading('1. Metodología Climatológica', level=1)
+    p = doc.add_paragraph()
+    p.add_run('Para el dimensionamiento de los Sistemas de Riego Individuales o Comunitarios (SRIC), ').bold = True
+    p.add_run('se ha utilizado información satelital de la plataforma WaPOR v3. La serie de datos analizada comprende un periodo de 10 años, garantizando la representatividad climática de la zona.')
+
+    doc.add_heading('2. Análisis de Precipitación Decadal', level=2)
+    doc.add_paragraph("Se define la 'década' como un periodo de exactamente 10 días (o el remanente del mes). Este intervalo permite capturar la variabilidad de la humedad en el suelo de forma más precisa que un promedio mensual.")
+
+    doc.add_heading('3. Cálculo de Probabilidad de Excedencia (P75)', level=2)
+    doc.add_paragraph("Se aplicó el método de Critchley y Siegert (1996) para determinar la precipitación persistente. La fórmula aplicada es:")
+    doc.add_paragraph("P % = [(m - 0.375) / (N + 0.25)] * 100", style='Intense Quote')
+    doc.add_paragraph("Donde 'm' es el orden de la serie y 'N' el número total de observaciones. Se asume el P75 como el valor de diseño para asegurar el suministro en años secos.")
+
+    # --- NUEVA SECCIÓN 4: Infraestructura de Almacenamiento ---
+    doc.add_heading('4. Dimensionamiento del Sistema de Almacenamiento', level=1)
+    p_almacenamiento = doc.add_paragraph(f"Para el presente proyecto SRIC, se ha seleccionado la alternativa constructiva de: ")
+    p_almacenamiento.add_run(f"{tipo_almacenamiento}").bold = True
+    p_almacenamiento.add_run(f", con una capacidad máxima proyectada (NAME) de {vol_max:.2f} m³.")
+
+    # Justificación técnica según el tipo de reservorio elegido
+    if "Excavado" in tipo_almacenamiento:
+        doc.add_paragraph("Dado que se trata de un reservorio excavado con geometría irregular, el espejo de agua y el volumen almacenado varían en función de la altura de la lámina de agua. Para el cálculo riguroso de las pérdidas por evaporación, se empleó una curva Cota-Área-Volumen derivada de la batimetría del sitio, ajustada numéricamente.")
+    else:
+        doc.add_paragraph("Al tratarse de un tanque australiano, se asume un área de espejo de agua constante (cilindro) para el cálculo de los aportes por precipitación directa y las salidas por evaporación libre.")
+
+    # --- NUEVA SECCIÓN 5: Balance Hídrico (Tabla 2 exigida por la ADR) ---
+    doc.add_heading('5. Funcionamiento del vaso de almacenamiento', level=1)
+    doc.add_paragraph("La simulación del tránsito del embalse se realizó a nivel decadal, evaluando las entradas frente a las salidas. A continuación, se presenta la Tabla 2 con el balance hídrico del sistema:")
+
+    if df_simulacion is not None and not df_simulacion.empty:
+        # Título de la tabla
+        doc.add_paragraph("Tabla 2. Funcionamiento del vaso de almacenamiento", style='Caption')
+        
+        # Crear la tabla en Word con 8 columnas (Estándar ADR)
+        columnas_tabla = ['AÑO', 'MES', 'DÉCADA', 'VOL. INICIAL (m3)', 'ENTRADAS (+)', 'SALIDAS (-)', 'VOL. FINAL (m3)', 'EXCEDENTE (m3)']
+        tabla = doc.add_table(rows=1, cols=len(columnas_tabla))
+        tabla.style = 'Table Grid'
+        
+        # Agregar encabezados
+        hdr_cells = tabla.rows[0].cells
+        for i, col_name in enumerate(columnas_tabla):
+            hdr_cells[i].text = col_name
+
+        # Llenar datos: Mostrar solo un año tipo (primeras 36 décadas) para que el Word no quede de 50 páginas
+        # Se suman las variables de la Pestaña 3 para condensarlas en "Entradas" y "Salidas"
+        for index, row in df_simulacion.head(36).iterrows():
+            row_cells = tabla.add_row().cells
+            
+            # Cálculos internos para unificar las entradas y salidas de tu df_simulacion
+            entradas_totales = row.get('Entrada Concesion (m3)', 0) + row.get('Entrada Lluvia (m3)', 0) + row.get('Entrada Escorrentia (m3)', 0)
+            salidas_totales = row.get('Salida Riego (m3)', 0) + row.get('Salida Evaporación (m3)', 0) + row.get('Salida Infiltración (m3)', 0)
+            
+            # Asignación a las celdas
+            row_cells[0].text = str(int(row.get('Año', 0)))
+            row_cells[1].text = "N/A" # O el mes si lo tienes en tu DF
+            row_cells[2].text = str(int(row.get('Decada', 0)))
+            row_cells[3].text = f"{row.get('Volumen Inicial (m3)', 0):.2f}"
+            row_cells[4].text = f"{entradas_totales:.2f}"
+            row_cells[5].text = f"{salidas_totales:.2f}"
+            row_cells[6].text = f"{row.get('Volumen Final (m3)', 0):.2f}"
+            row_cells[7].text = f"{row.get('Volumen Derramado (m3)', 0):.2f}"
+            
+        p_nota = doc.add_paragraph()
+        p_nota.add_run("*Nota: Por extensión, se presentan los resultados correspondientes al primer año de simulación (36 décadas). El balance histórico completo reposa en los archivos digitales del proyecto.").italic = True
+    else:
+        doc.add_paragraph("⚠️ Error: No se encontraron datos de simulación. Ejecute la Pestaña 3 primero.")
+
+    return doc
+
+def crear_memoria_demandas(datos_cultivo):
+    doc = Document()
+    doc.add_heading('Memoria de Cálculo: Disponibilidad y Demandas hídricas', 0)
+    
+    doc.add_heading('1. Demanda Hídrica del Cultivo (ETc)', level=1)
+    doc.add_paragraph(
+        "El cálculo de la demanda se basa en la interacción entre la Evapotranspiración de Referencia (ET0) "
+        "y el Coeficiente de Cultivo (Kc) específico para cada etapa fenológica."
+    )
+    
+    doc.add_paragraph("ETc = ET0 * Kc", style='Intense Quote')
+    
+    doc.add_heading('2. Requerimiento de Riego', level=2)
+    doc.add_paragraph(
+        "Considerando la precipitación efectiva calculada en el Anexo 3, el requerimiento neto (Rn) se define como:"
+    )
+    doc.add_paragraph("Rn = ETc - P_efectiva", style='Intense Quote')
+    
+    return doc
 
 # Inicialización de variables de estado (Session State)
 # Coloca esto en la parte superior de tu app.py, fuera de cualquier pestaña
@@ -406,318 +509,126 @@ with tab1:
 # =====================================================================
 
 with tab2:
-    st.markdown("### Balance Hídrico y Diseño Hidráulico")
-    st.markdown("Determinación paso a paso de las necesidades netas, brutas y el dimensionamiento de caudales de diseño por sector.")
-    
-    # --- SECCIÓN 1: DATOS CLIMÁTICOS ---
-    st.subheader("1. Ubicación y Periodo")
-    fuente_clima_t2 = st.radio(
-        "Fuente climática para Pestaña 2:",
-        ["Usar datos procesados en Pestaña 1", "NASA POWER (API Online)"],
-        horizontal=True,
-        key="fuente_clima_t2"
-    )
-
-    col1, col2 = st.columns(2)
-    with col1:
-        lat_input = st.number_input("Latitud", value=6.326512, format="%.6f", key="lat_nasa_t2")
-    with col2:
-        lon_input = st.number_input("Longitud", value=-73.609413, format="%.6f", key="lon_nasa_t2")
-
-    col3, col4 = st.columns(2)
-    with col3:
-        fecha_inicio = st.date_input("Fecha Inicio", pd.to_datetime("2018-01-01"), key="fi_nasa_t2")
-    with col4:
-        fecha_fin = st.date_input("Fecha Fin", pd.to_datetime("2025-12-31"), key="ff_nasa_t2")
-
-# --- SECCIÓN 2: PARÁMETROS AGRONÓMICOS ---
-    st.subheader("2. Parámetros Agronómicos y Fenología")
-    ca1, ca2, ca3 = st.columns(3)
-    with ca1:
-        area_total = st.number_input("Área Total (Ha)", value=0.50, step=0.1, min_value=0.01, key="area_tot")
-    with ca2:
-        num_sectores = st.number_input("Número de Sectores", value=1, min_value=1, step=1, key="num_sect")
-    with ca3:
-        decada_inicio = st.number_input("Década de Inicio (1-36)", min_value=1, max_value=36, value=1, key="dec_ini")
+        st.markdown("### Balance Hídrico y Diseño Hidráulico")
+        st.markdown("Determinación paso a paso de las necesidades netas, brutas y el dimensionamiento de caudales de diseño por sector.")
         
-    siembra_escalonada = st.checkbox("¿Aplicar siembra escalonada entre sectores?", value=True, key="check_esc")
-    paso_escalonamiento = st.number_input("Décadas de espera entre siembra", min_value=0, value=1, key="paso_esc") if siembra_escalonada else 0
+        # --- SECCIÓN 1: DATOS CLIMÁTICOS ---
+        st.subheader("1. Ubicación y Periodo")
+        fuente_clima_t2 = st.radio(
+            "Fuente climática para Pestaña 2:",
+            ["Usar datos procesados en Pestaña 1", "NASA POWER (API Online)"],
+            horizontal=True,
+            key="fuente_clima_t2"
+        )
 
-    st.markdown("**Fenología del Cultivo (Duración y Kc por etapa)**")
-    ck1, ck2, ck3 = st.columns(3)
-    with ck1:
-        kc_ini = st.number_input("Kc Inicial", value=0.40, step=0.05, min_value=0.0, key="kc_i")
-        dur_ini = st.number_input("Dur. Inicial", value=6, min_value=1, key="dur_i")
-    with ck2:
-        kc_mid = st.number_input("Kc Medio", value=1.10, step=0.05, min_value=0.0, key="kc_m")
-        dur_mid = st.number_input("Dur. Media", value=6, min_value=1, key="dur_m")
-    with ck3:
-        kc_end = st.number_input("Kc Final", value=0.60, step=0.05, min_value=0.0, key="kc_f")
-        dur_end = st.number_input("Dur. Final", value=5, min_value=1, key="dur_f")
+        col1, col2 = st.columns(2)
+        with col1:
+            lat_input = st.number_input("Latitud", value=6.326512, format="%.6f", key="lat_nasa_t2")
+        with col2:
+            lon_input = st.number_input("Longitud", value=-73.609413, format="%.6f", key="lon_nasa_t2")
 
-    duracion_total = int(dur_ini + dur_mid + dur_end)
-    sembrar_multiple = st.checkbox("Habilitar múltiples ciclos de producción", value=True, key="check_mult") if duracion_total < 36 else False
-    descanso = st.number_input("Décadas de descanso", min_value=0, value=1, key="descanso") if sembrar_multiple else 0
+        col3, col4 = st.columns(2)
+        with col3:
+            fecha_inicio = st.date_input("Fecha Inicio", pd.to_datetime("2018-01-01"), key="fi_nasa_t2")
+        with col4:
+            fecha_fin = st.date_input("Fecha Fin", pd.to_datetime("2025-12-31"), key="ff_nasa_t2")
 
-    # --- SECCIÓN 3: CONFIGURACIÓN DEL SISTEMA DE RIEGO ---
-    st.subheader("3. Configuración del Sistema de Riego")
-    
-    # Nuevo selector para elegir el tipo de riego
-    tipo_riego = st.radio("Tipo de Riego", options=["Riego por goteo", "Riego por aspersión"], horizontal=True, key="tipo_riego")
-    
-    if tipo_riego == "Riego por goteo":
-        cs1, cs2, cs3, cs4 = st.columns(4)
-        with cs1: dist_emisores = st.number_input("Dist. Emisores (m)", value=0.20, step=0.05, min_value=0.01, key="dist_e")
-        with cs2: dist_laterales = st.number_input("Dist. Laterales (m)", value=1.20, step=0.05, min_value=0.01, key="dist_l")
-        with cs3: emisores_planta = st.number_input("Emisores / Planta", value=2, min_value=1, key="em_pl")
-        with cs4: caudal_emisor_lh = st.number_input("Caudal Gotero (L/h)", value=1.00, step=0.1, min_value=0.01, key="q_got")
-    else:
-        # Inputs exclusivos para aspersión
-        cs1, cs2 = st.columns(2)
-        with cs1: num_aspersores_ha = st.number_input("Número de aspersores por ha", value=100, min_value=1, step=1, key="num_asp_ha")
-        with cs2: caudal_emisor_lh = st.number_input("Caudal del Aspersor (L/h)", value=500.0, step=10.0, min_value=1.0, key="q_asp")
+        # --- SECCIÓN 2: PARÁMETROS AGRONÓMICOS ---
+        st.subheader("2. Parámetros Agronómicos y Fenología")
+        ca1, ca2, ca3 = st.columns(3)
+        with ca1:
+            area_total = st.number_input("Área Total (Ha)", value=0.50, step=0.1, min_value=0.01, key="area_tot")
+        with ca2:
+            num_sectores = st.number_input("Número de Sectores", value=1, min_value=1, step=1, key="num_sect")
+        with ca3:
+            decada_inicio = st.number_input("Década de Inicio (1-36)", min_value=1, max_value=36, value=1, key="dec_ini")
+            
+        siembra_escalonada = st.checkbox("¿Aplicar siembra escalonada entre sectores?", value=True, key="check_esc")
+        paso_escalonamiento = st.number_input("Décadas de espera entre siembra", min_value=0, value=1, key="paso_esc") if siembra_escalonada else 0
 
-    # Inputs de eficiencia (siguen igual)
-    ce1, ce2, ce3, ce4, ce5 = st.columns(5)
-    with ce1: area_sombreada = st.number_input("% Sombreado", value=65.0, step=5.0, min_value=0.0, max_value=100.0, key="a_som")
-    with ce2: pct_sustrato = st.number_input("% Sustrato", value=100.0, step=5.0, min_value=0.0, max_value=100.0, key="p_sus")
-    with ce3: ef_cond = st.number_input("% Ef. Cond", value=98.0, step=1.0, min_value=0.0, max_value=100.0, key="ef_c")
-    with ce4: ef_dist = st.number_input("% Ef. Dist", value=98.0, step=1.0, min_value=0.0, max_value=100.0, key="ef_d")
-    with ce5: ef_rieg = st.number_input("% Ef. Riego", value=90.0, step=1.0, min_value=0.0, max_value=100.0, key="ef_r")
+        st.markdown("**Selección de Cultivo (Seguridad Alimentaria - FAO 56)**")
+        
+        # Base de datos de cultivos (Duraciones en décadas de 10 días) - Sin Plátano
+        base_cultivos = {
+            "Maíz (Grano Seco)": {"kc_ini": 0.30, "kc_mid": 1.20, "kc_end": 0.50, "L_ini": 3, "L_dev": 4, "L_mid": 4, "L_late": 3},
+            "Maíz (Dulce/Húmedo)": {"kc_ini": 0.30, "kc_mid": 1.15, "kc_end": 1.05, "L_ini": 2, "L_dev": 3, "L_mid": 3, "L_late": 1},
+            "Frijol Seco": {"kc_ini": 0.40, "kc_mid": 1.15, "kc_end": 0.35, "L_ini": 2, "L_dev": 3, "L_mid": 4, "L_late": 2},
+            "Yuca (Cassava)": {"kc_ini": 0.30, "kc_mid": 1.10, "kc_end": 0.50, "L_ini": 2, "L_dev": 4, "L_mid": 15, "L_late": 6},
+            "Ñame (Yam)": {"kc_ini": 0.30, "kc_mid": 1.10, "kc_end": 0.60, "L_ini": 6, "L_dev": 8, "L_mid": 12, "L_late": 4},
+            "Personalizado": {"kc_ini": 0.40, "kc_mid": 1.10, "kc_end": 0.60, "L_ini": 3, "L_dev": 4, "L_mid": 4, "L_late": 3}
+        }
 
-    if 'calcular_t2' not in st.session_state: st.session_state['calcular_t2'] = False
-    if st.button("Calcular Diseño Paso a Paso", type="primary", key="btn_calc_t2_run"): st.session_state['calcular_t2'] = True
+        cultivo_seleccionado = st.selectbox("Seleccione el cultivo a establecer:", list(base_cultivos.keys()))
+        datos_c = base_cultivos[cultivo_seleccionado]
 
-    if st.session_state['calcular_t2']:
-        with st.spinner('Procesando datos hídricos, agronómicos e hidráulicos... 🚀'):
-            try:
-                import folium
-                import streamlit.components.v1 as components
+        # Mostrar inputs editables por si el usuario quiere ajustar la base de datos localmente
+        ck1, ck2, ck3, ck4 = st.columns(4)
+        with ck1:
+            kc_ini = st.number_input("Kc Inicial", value=datos_c["kc_ini"], step=0.05, key="kc_i")
+            L_ini = st.number_input("Dur. Inicial (Décadas)", value=datos_c["L_ini"], min_value=1, key="l_i")
+        with ck2:
+            kc_mid = st.number_input("Kc Medio", value=datos_c["kc_mid"], step=0.05, key="kc_m")
+            L_dev = st.number_input("Dur. Desarrollo", value=datos_c["L_dev"], min_value=1, key="l_d")
+        with ck3:
+            kc_end = st.number_input("Kc Final", value=datos_c["kc_end"], step=0.05, key="kc_f")
+            L_mid = st.number_input("Dur. Media", value=datos_c["L_mid"], min_value=1, key="l_m")
+        with ck4:
+            st.write("") # Espaciador
+            st.write("")
+            L_late = st.number_input("Dur. Final (Maduración)", value=datos_c["L_late"], min_value=1, key="l_l")
 
-                # --- MAPA SATELITAL (DEPARTAMENTO Y MUNICIPIO) ---
-                st.divider()
-                st.subheader("🌍 Ubicación del Proyecto")
-                m = folium.Map(location=[lat_input, lon_input], zoom_start=9)
-                folium.TileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', attr='Esri', name='Esri Satellite').add_to(m)
-                folium.Marker([lat_input, lon_input], tooltip="Punto de Proyecto").add_to(m)
-                
-                try:
-                    import time
-                    headers = {'User-Agent': 'HidroApp_SIG_Project/1.0'}
-                    
-                    # Polígono del Departamento (Zoom 5)
-                    url_dep = f"https://nominatim.openstreetmap.org/reverse?lat={lat_input}&lon={lon_input}&format=json&polygon_geojson=1&zoom=5"
-                    res_dep = requests.get(url_dep, headers=headers)
-                    if res_dep.status_code == 200:
-                        data_dep = res_dep.json()
-                        if 'geojson' in data_dep and data_dep['geojson']['type'] in ['Polygon', 'MultiPolygon']:
-                            folium.GeoJson(
-                                data_dep['geojson'], 
-                                style_function=lambda x: {'fillColor': '#FFA500', 'color': '#FF8C00', 'weight': 2, 'fillOpacity': 0.1}, 
-                                tooltip=f"Departamento: {data_dep.get('name', 'N/A')}"
-                            ).add_to(m)
-                    
-                    time.sleep(1.5) # Pausa para no saturar la API
-                    
-                    # Polígono del Municipio (Zoom 10)
-                    url_mun = f"https://nominatim.openstreetmap.org/reverse?lat={lat_input}&lon={lon_input}&format=json&polygon_geojson=1&zoom=10"
-                    res_mun = requests.get(url_mun, headers=headers)
-                    if res_mun.status_code == 200:
-                        data_mun = res_mun.json()
-                        if 'geojson' in data_mun and data_mun['geojson']['type'] in ['Polygon', 'MultiPolygon']:
-                            folium.GeoJson(
-                                data_mun['geojson'], 
-                                style_function=lambda x: {'fillColor': '#00FFFF', 'color': '#008B8B', 'weight': 3, 'fillOpacity': 0.35}, 
-                                tooltip=f"Municipio: {data_mun.get('name', 'N/A')}"
-                            ).add_to(m)
-                except Exception as e:
-                    st.warning(f"Aviso SIG: No se pudieron cargar los límites políticos automáticos. ({e})")
-                
-                components.html(m._repr_html_(), height=400)
+        duracion_total = int(L_ini + L_dev + L_mid + L_late)
+        
+        # --- CONSTRUCCIÓN DE LA CURVA KC (Interpolación Lineal FAO) ---
+        curva_kc = []
+        # 1. Fase Inicial (Constante)
+        curva_kc.extend([kc_ini] * int(L_ini))
+        # 2. Fase de Desarrollo (Interpolación de kc_ini a kc_mid)
+        if L_dev > 0:
+            paso_dev = (kc_mid - kc_ini) / L_dev
+            curva_kc.extend([kc_ini + paso_dev * (i + 1) for i in range(int(L_dev))])
+        # 3. Fase Media (Constante)
+        curva_kc.extend([kc_mid] * int(L_mid))
+        # 4. Fase Final (Interpolación de kc_mid a kc_end)
+        if L_late > 0:
+            paso_late = (kc_end - kc_mid) / L_late
+            curva_kc.extend([kc_mid + paso_late * (i + 1) for i in range(int(L_late))])
 
-                # --- 1. FUENTE CLIMÁTICA (SESIÓN TAB1 O NASA) ---
-                usar_sesion_tab1 = (
-                    fuente_clima_t2 == "Usar datos procesados en Pestaña 1"
-                    and 'df_base_diario_tab1' in st.session_state
-                    and st.session_state['df_base_diario_tab1'] is not None
-                    and not st.session_state['df_base_diario_tab1'].empty
-                )
+        # Visualización de la Curva
+        import plotly.graph_objects as go
+        fig_kc = go.Figure()
+        fig_kc.add_trace(go.Scatter(x=list(range(1, duracion_total + 1)), y=curva_kc, mode='lines+markers', name='Curva Kc', line=dict(color='DarkGreen', width=3)))
+        fig_kc.update_layout(title=f"Curva Fenológica del {cultivo_seleccionado} (Ciclo: {duracion_total*10} días)", xaxis_title="Décadas (10 días)", yaxis_title="Coeficiente de Cultivo (Kc)", height=350, margin=dict(l=0, r=0, t=40, b=0))
+        st.plotly_chart(fig_kc, use_container_width=True)
 
-                if usar_sesion_tab1:
-                    df_clima_t2 = st.session_state['df_base_diario_tab1'].copy()
-                    if 'Decada_Año' not in df_clima_t2.columns:
-                        df_clima_t2 = agregar_decadas(df_clima_t2)
-                    st.info("Usando serie climática procesada en Pestaña 1 (NASA/WaPOR).")
-                else:
-                    if fuente_clima_t2 == "Usar datos procesados en Pestaña 1":
-                        st.warning("No hay datos previos válidos en Pestaña 1. Se usará NASA POWER.")
-                    df_clima_t2 = preparar_base_nasa(lat_input, lon_input, fecha_inicio, fecha_fin)
-                    df_clima_t2 = agregar_decadas(df_clima_t2)
+        sembrar_multiple = st.checkbox("Habilitar múltiples ciclos de producción", value=True, key="check_mult") if duracion_total < 36 else False
+        descanso = st.number_input("Décadas de descanso", min_value=0, value=1, key="descanso") if sembrar_multiple else 0
+        
+        # --- SECCIÓN 3: CONFIGURACIÓN DEL SISTEMA DE RIEGO ---
+        st.subheader("3. Configuración del Sistema de Riego")
+        
+        # Nuevo selector para elegir el tipo de riego
+        tipo_riego = st.radio("Tipo de Riego", options=["Riego por goteo", "Riego por aspersión"], horizontal=True, key="tipo_riego")
+        
+        if tipo_riego == "Riego por goteo":
+            cs1, cs2, cs3, cs4 = st.columns(4)
+            with cs1: dist_emisores = st.number_input("Dist. Emisores (m)", value=0.20, step=0.05, min_value=0.01, key="dist_e")
+            with cs2: dist_laterales = st.number_input("Dist. Laterales (m)", value=1.20, step=0.05, min_value=0.01, key="dist_l")
+            with cs3: emisores_planta = st.number_input("Emisores / Planta", value=2, min_value=1, key="em_pl")
+            with cs4: caudal_emisor_lh = st.number_input("Caudal Gotero (L/h)", value=1.00, step=0.1, min_value=0.01, key="q_got")
+        else:
+            # Inputs exclusivos para aspersión
+            cs1, cs2 = st.columns(2)
+            with cs1: num_aspersores_ha = st.number_input("Número de aspersores por ha", value=100, min_value=1, step=1, key="num_asp_ha")
+            with cs2: caudal_emisor_lh = st.number_input("Caudal del Aspersor (L/h)", value=500.0, step=10.0, min_value=1.0, key="q_asp")
 
-                df_dec_anual = df_clima_t2.groupby(['Año', 'Decada_Año'])[['Precipitacion', 'Evaporacion', 'RET']].sum().reset_index()
-                df_prom = df_dec_anual.groupby('Decada_Año')[['Evaporacion', 'RET']].mean().reset_index()
-                
-                # --- 4. PRECIPITACIÓN AL 75% Y EFECTIVA ---
-                def p75(s):
-                    if len(s) == 0: 
-                        return 0.0
-                    return np.percentile(s, 25)
-
-                # Integración decadal
-                df_prom = pd.merge(df_prom, df_dec_anual.groupby('Decada_Año')['Precipitacion'].apply(p75).reset_index().rename(columns={'Precipitacion': 'Prec_75%'}), on='Decada_Año')
-                P = df_prom['Prec_75%'].values
-                
-                # Cálculo de precipitación efectiva (Fórmula USDA)
-                df_prom['Prec_Efectiva'] = np.where(P < (250/3), P*((125-0.6*P)/125), (125/3)+0.1*P)
-                p_efec = df_prom['Prec_Efectiva'].values
-
-                # --- 5. MATRICES KC Y ÁREA ---
-                kc_m, area_m = np.zeros((num_sectores, 36)), np.zeros((num_sectores, 36))
-                curva_kc = [kc_ini]*int(dur_ini) + [kc_mid]*int(dur_mid) + [kc_end]*int(dur_end)
-                timeline = []
-                while len(timeline) < 36:
-                    timeline.extend(curva_kc)
-                    if not sembrar_multiple: timeline.extend([0]*(36 - len(timeline))); break
-                    else: timeline.extend([0]*int(descanso))
-                timeline = timeline[:36] 
-                
-                for i in range(num_sectores):
-                    idx = (int(decada_inicio)-1 + i*paso_escalonamiento)%36
-                    for j in range(36):
-                        d_act = (idx + j)%36
-                        kc_m[i, d_act] = timeline[j]
-                        if timeline[j] > 0: area_m[i, d_act] = area_total / num_sectores
-
-                cols_d = [f"D{d}" for d in range(1, 37)]
-                idx_s = [f"Sector {i+1}" for i in range(num_sectores)]
-                df_kc, df_area = pd.DataFrame(kc_m, columns=cols_d, index=idx_s), pd.DataFrame(area_m, columns=cols_d, index=idx_s)
-                
-                df_ret_matrix = pd.DataFrame([df_prom['RET'].values], columns=cols_d, index=['Clima Base'])
-                df_pefec_matrix = pd.DataFrame([p_efec], columns=cols_d, index=['Clima Base'])
-
-                # --- 6. USO CONSUNTIVO Y CAUDALES ---
-                uso_m, dem_n_m, dem_b_m = np.zeros((num_sectores,36)), np.zeros((num_sectores,36)), np.zeros((num_sectores,36))
-                t_app_m, q_dem_m, q_dis_m = np.zeros((num_sectores,36)), np.zeros((num_sectores,36)), np.zeros((num_sectores,36))
-                ef_g = (ef_cond/100)*(ef_dist/100)*(ef_rieg/100)
-                
-                # Arreglo de días de la década para cada mes (tiene en cuenta 8/9 para febrero dependiendo del año, 
-                # en este arreglo estático se simplifican los días de cada década en el año).
-                dias_d = np.array([10,10,11, 10,10,8, 10,10,11, 10,10,10, 10,10,11, 10,10,10, 10,10,11, 10,10,11, 10,10,10, 10,10,11, 10,10,10, 10,10,11])
-                ret_v = df_prom['RET'].values
-                
-                # Pre-cálculo para aspersión: Intensidad de aplicación en mm/hr
-                intensidad_app = 0
-                if tipo_riego == "Riego por aspersión":
-                    # Caudal emisor / Área por emisor
-                    intensidad_app = caudal_emisor_lh / (10000 / num_aspersores_ha)
-
-                for i in range(num_sectores):
-                    for j in range(36):
-                        if kc_m[i,j] > 0:
-                            uso_m[i,j] = ret_v[j] * kc_m[i,j] * (pct_sustrato/100) * ((area_sombreada/100) + 0.15*(1 - (area_sombreada/100)))
-                        
-                        diff = uso_m[i,j] - p_efec[j]
-                        dem_n_m[i,j] = diff if diff > 0 else 0
-                        dem_b_m[i,j] = dem_n_m[i,j] / ef_g
-                        
-                        if dem_b_m[i,j] > 0:
-                            # TIEMPO DE APLICACIÓN
-                            if tipo_riego == "Riego por goteo":
-                                t_app_m[i,j] = (dist_emisores*dist_laterales*(dem_b_m[i,j]/dias_d[j])*num_sectores) / (emisores_planta*caudal_emisor_lh)
-                            else:
-                                # Aspersión: = Demanda Bruta / (Intensidad * número de días década)
-                                t_app_m[i,j] = dem_b_m[i,j] / (intensidad_app * dias_d[j])
-
-                # Maximo tiempo de aplicación de toda la matriz como referencia (útil en goteo)
-                t_max = t_app_m.max() if t_app_m.max() > 0 else 1
-                
-                # CAUDAL DEMANDADO Y DE DISEÑO
-                for i in range(num_sectores):
-                    for j in range(36):
-                        if dem_b_m[i,j] > 0:
-                            if tipo_riego == "Riego por goteo":
-                                # Goteo: Se calcula el Caudal Específico (L/s por Hectárea)
-                                q_dem_m[i,j] = ((dem_b_m[i,j]*10*1000)/(t_max*3600)) / dias_d[j]
-                                # El Caudal de diseño del sector es el Específico multiplicado SOLO por el área del sector
-                                q_dis_m[i,j] = q_dem_m[i,j] * area_m[i, j] 
-                            else:
-                                # Aspersión: Caudal instantáneo demandado por el sector (L/s)
-                                q_dem_m[i,j] = (num_aspersores_ha * caudal_emisor_lh * area_m[i, j]) / 3600
-                                
-                                # Aspersión Diseño: Caudal continuo equivalente a 24h escalado a toda la finca
-                                # (Caudal demandado * Tiempo aplicación / 24) * (Area total / Área sector)
-                                q_dis_m[i,j] = (q_dem_m[i,j] * (t_app_m[i,j] / 24)) * (area_total / area_m[i, j])
-
-                df_uso, df_dn, df_db = pd.DataFrame(uso_m, columns=cols_d, index=idx_s), pd.DataFrame(dem_n_m, columns=cols_d, index=idx_s), pd.DataFrame(dem_b_m, columns=cols_d, index=idx_s)
-                df_t, df_qd, df_qdis = pd.DataFrame(t_app_m, columns=cols_d, index=idx_s), pd.DataFrame(q_dem_m, columns=cols_d, index=idx_s), pd.DataFrame(q_dis_m, columns=cols_d, index=idx_s)
-
-                df_prom['Dem_Neta'] = dem_n_m.max(axis=0); df_prom['Dem_Bruta'] = dem_b_m.max(axis=0)
-                df_prom['T_App'] = t_app_m.max(axis=0); df_prom['Q_Diseno'] = q_dis_m.sum(axis=0) 
-
-                st.success("✅ Cálculos completados con éxito.")
-
-                # --- FUNCIONES DE ESTILO VISUAL ---
-                def color_kc(val): return 'background-color:#d4edda;color:black' if math.isclose(val,kc_ini) else 'background-color:#ffe8cc;color:black' if math.isclose(val,kc_mid) else 'background-color:#f8d7da;color:black' if math.isclose(val,kc_end) else ''
-                
-                # Nueva función para resaltar el valor máximo en toda la matriz
-                def resaltar_maximo(df):
-                    max_val = df.max().max()
-                    # Crea un DataFrame vacío con la misma forma para almacenar los estilos
-                    styles = pd.DataFrame('', index=df.index, columns=df.columns)
-                    if max_val > 0:
-                        # Aplica el estilo rojo solo a la celda que coincida con el máximo global
-                        styles[df == max_val] = 'background-color: #ff4b4b; color: white; font-weight: bold;'
-                    return styles
-
-                # --- VISUALIZACIONES EN ACORDEONES ---
-                st.divider()
-                st.subheader("🌦️ Paso 1: Matrices Climáticas Base")
-                with st.expander("Ver Matriz de Evapotranspiración de Referencia - RET (mm/década)"): st.dataframe(df_ret_matrix.style.format("{:.2f}"))
-                with st.expander("Ver Matriz de Precipitación Efectiva (mm/década)"): st.dataframe(df_pefec_matrix.style.format("{:.2f}"))
-
-                st.subheader("🌾 Paso 2: Matrices Agronómicas")
-                with st.expander("Ver Matriz de Coeficiente de Cultivo (Kc)", expanded=True): st.dataframe(df_kc.style.map(color_kc).format("{:.2f}"))
-                with st.expander("Ver Matriz de Área Sembrada por Sector (Ha)"): st.dataframe(df_area.style.format("{:.2f}"))
-                with st.expander("Ver Matriz de Uso Consuntivo de la Planta (mm/década)"): st.dataframe(df_uso.style.format("{:.2f}"))
-
-                st.subheader("💧 Paso 3: Matrices de Diseño Hidráulico")
-                with st.expander("Ver Matriz de Demanda Neta (mm/década)"): st.dataframe(df_dn.style.format("{:.2f}"))
-                with st.expander("Ver Matriz de Demanda Bruta (mm/década)"): st.dataframe(df_db.style.format("{:.2f}"))
-                with st.expander("Ver Matriz de Tiempo de Aplicación (Horas/Día)"): st.dataframe(df_t.style.format("{:.3f}"))
-                
-                # Se aplica el estilo 'resaltar_maximo' a estas dos matrices específicas
-                with st.expander("Ver Matriz de Caudal Demandado (L/s-ha)"): 
-                    st.dataframe(df_qd.style.apply(resaltar_maximo, axis=None).format("{:.3f}"))
-                with st.expander("Ver Matriz de Caudal de Diseño (L/s)"): 
-                    st.dataframe(df_qdis.style.apply(resaltar_maximo, axis=None).format("{:.3f}"))
-
-                st.divider()
-                st.subheader("📊 Gráficas Generales del Sistema")
-                import plotly.express as px
-                df_agron = df_prom.melt(id_vars=['Decada_Año'], value_vars=['Prec_Efectiva', 'Dem_Neta', 'Dem_Bruta'], var_name='Variable', value_name='Volumen (mm/década)')
-                fig_agron = px.line(df_agron, x='Decada_Año', y='Volumen (mm/década)', color='Variable', markers=True, color_discrete_map={'Prec_Efectiva': '#2ca02c', 'Dem_Neta': '#1f77b4', 'Dem_Bruta': '#d62728'}, title="Balance Hídrico (Máximos por década)")
-                st.plotly_chart(fig_agron, use_container_width=True)
-
-                st.info(f"⏱️ **Tiempo de aplicación máximo del sistema:** {t_max:.3f} horas/día.\n\n🌊 **Caudal Máximo del Sistema de Bombeo/Captación:** {df_prom['Q_Diseno'].max():.3f} L/s.")
-                
-                df_hidro = df_prom.melt(id_vars=['Decada_Año'], value_vars=['Q_Diseno', 'T_App'], var_name='Variable', value_name='Valor')
-                fig_hidro = px.line(df_hidro, x='Decada_Año', y='Valor', color='Variable', markers=True, title="Comportamiento del Caudal Total y Tiempos de Riego", facet_row='Variable')
-                fig_hidro.update_yaxes(matches=None)
-                st.plotly_chart(fig_hidro, use_container_width=True)
-                
-                csv = df_prom.round(3).to_csv(index=False, sep=";")
-                st.download_button("📥 Descargar Tabla General de Promedios y Totales (CSV)", data=csv, file_name=f"Diseno_Completo_{lat_input}_{lon_input}.csv", mime="text/csv", key="btn_down_final_t2")
-                    
-                st.session_state['df_chrono'] = df_dec_anual
-                st.session_state['q_diseno_decadal'] = df_prom['Q_Diseno'].values
-                st.session_state['t_max'] = t_max
-                st.session_state['area_total_ha'] = area_total
-                st.session_state['q_diseno'] = q_dis_m # Matriz de caudales
-
-            except Exception as e:
-                st.error("Error técnico al procesar el diseño hidráulico.")
-                st.info(f"Detalle: {e}")
-
+        # Inputs de eficiencia
+        ce1, ce2, ce3, ce4, ce5 = st.columns(5)
+        with ce1: area_sombreada = st.number_input("% Sombreado", value=65.0, step=5.0, min_value=0.0, max_value=100.0, key="a_som")
+        with ce2: pct_sustrato = st.number_input("% Sustrato", value=100.0, step=5.0, min_value=0.0, max_value=100.0, key="p_sus")
+        with ce3: ef_cond = st.number_input("% Ef. Cond", value=98.0, step=1.0, min_value=0.0, max_value=100.0, key="ef_c")
+        with ce4: ef_dist = st.number_input("% Ef. Dist", value=98.0, step=1.0, min_value=0.0, max_value=100.0, key="ef_d")
+        with ce5: ef_rieg = st.number_input("% Ef. Riego", value=90.0, step=1.0, min_value=0.0, max_value=100.0
                
                 
 # =====================================================================
@@ -726,30 +637,80 @@ with tab2:
 
 with tab3:
     st.markdown("### Simulación Cronológica del Reservorio")
-    st.markdown("Tránsito del embalse frente a la serie climática histórica para evaluar el riesgo de déficit. Incluye aportes por precipitación directa y cosecha de techos.")
-    
-    st.subheader("1. Dimensiones del Tanque Australiano")
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        radio_tanque = st.number_input("Radio del Tanque (m)", value=10.0, step=0.5, min_value=1.0)
-    with col2:
-        altura_tanque = st.number_input("Altura Útil Máxima (m)", value=1.50, step=0.1, min_value=0.5)
-    with col3:
-        caudal_concesion = st.number_input("Caudal Concesión Constante (L/s)", value=0.0, step=0.1, min_value=0.0, help="Entrada permanente de fuente externa.")
+    st.markdown("Tránsito del embalse frente a la serie climática histórica para evaluar el riesgo de déficit.")
 
-    st.subheader("2. Cosecha de Aguas Lluvias (Tejado/Ramada)")
-    habilitar_cosecha = st.checkbox("¿Implementar cosecha de aguas lluvias mediante cubierta?", value=False, key="check_cosecha")
-    
-    if habilitar_cosecha:
-        col4, col5, col6 = st.columns(3)
-        with col4:
-            largo_tejado = st.number_input("Largo Tejado (m)", value=10.0, step=1.0, min_value=0.0)
-        with col5:
-            ancho_tejado = st.number_input("Ancho Tejado (m)", value=10.0, step=1.0, min_value=0.0)
-        with col6:
-            coef_escorrentia = st.number_input("Coeficiente de Escorrentía", value=0.90, step=0.05, min_value=0.0, max_value=1.0)
+    # 1. Selección de Infraestructura Principal
+    tipo_almacenamiento = st.radio(
+        "Seleccione el tipo de estructura de almacenamiento:",
+        ["Opción 1: Tanque Australiano (Cilíndrico)", "Opción 3: Reservorio Excavado (Vaso Irregular)"],
+        help="La Opción 3 utiliza curvas de nivel para un cálculo más preciso en terrenos irregulares."
+    )
+
+    # Variables de inicialización
+    es_excavado = False
+    vol_max_sistema = 0.0
+    area_fija_espejo = 0.0
+
+    if tipo_almacenamiento == "Opción 1: Tanque Australiano (Cilíndrico)":
+        st.subheader("1. Dimensiones del Tanque Australiano")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            radio_tanque = st.number_input("Radio del Tanque (m)", value=10.0, step=0.5, min_value=1.0)
+        with col2:
+            altura_tanque = st.number_input("Altura Útil Máxima (m)", value=1.50, step=0.1, min_value=0.5)
+        with col3:
+            caudal_concesion = st.number_input("Caudal Concesión Constante (L/s)", value=0.0, step=0.1, min_value=0.0)
+        
+        area_fija_espejo = math.pi * (radio_tanque**2)
+        vol_max_sistema = area_fija_espejo * altura_tanque
+
+        st.subheader("2. Cosecha de Aguas Lluvias (Opción 2)")
+        habilitar_cosecha = st.checkbox("¿Implementar cosecha de aguas lluvias mediante cubierta?", value=False, key="check_cosecha")
+        
+        if habilitar_cosecha:
+            col4, col5, col6 = st.columns(3)
+            with col4:
+                largo_tejado = st.number_input("Largo Tejado (m)", value=10.0, step=1.0, min_value=0.0)
+            with col5:
+                ancho_tejado = st.number_input("Ancho Tejado (m)", value=10.0, step=1.0, min_value=0.0)
+            with col6:
+                coef_escorrentia = st.number_input("Coeficiente de Escorrentía", value=0.90, step=0.05, min_value=0.0, max_value=1.0)
+        else:
+            largo_tejado, ancho_tejado, coef_escorrentia = 0.0, 0.0, 0.0
+
     else:
-        largo_tejado, ancho_tejado, coef_escorrentia = 0.0, 0.0, 0.0
+        st.subheader("1. Diseño de Reservorio Excavado")
+        st.info("Se deshabilitan dimensiones de tanques comerciales para usar batimetría de campo.")
+        es_excavado = True
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            prof_max = st.number_input("Profundidad máxima (m)", value=2.0, step=0.25, min_value=0.5)
+        with col2:
+            caudal_concesion = st.number_input("Caudal Concesión (L/s)", value=0.0, step=0.1, min_value=0.0)
+
+        # Generación de tabla de batimetría
+        intervalos = np.arange(0, prof_max + 0.25, 0.25)
+        df_bat_init = pd.DataFrame({
+            "Altura (m)": intervalos,
+            "Área Espejo (m2)": [0.0] * len(intervalos),
+            "Volumen Acumulado (m3)": [0.0] * len(intervalos)
+        })
+        
+        st.write("Ingrese los datos de la batimetría proyectada:")
+        df_bat_usuario = st.data_editor(df_bat_init, num_rows="fixed", use_container_width=True)
+        
+        if df_bat_usuario["Volumen Acumulado (m3)"].max() > 0:
+            vol_max_sistema = df_bat_usuario["Volumen Acumulado (m3)"].max()
+            # Lógica interna para interpolación
+            h_vals = df_bat_usuario["Altura (m)"].values
+            a_vals = df_bat_usuario["Área Espejo (m2)"].values
+            v_vals = df_bat_usuario["Volumen Acumulado (m3)"].values
+            
+            # Funciones de apoyo para la simulación
+            func_area = lambda v: np.interp(v, v_vals, a_vals)
+        else:
+            st.warning("⚠️ Complete la tabla de batimetría para habilitar la simulación.")
 
     if st.button("Simular Tránsito del Reservorio", type="primary"):
         if 'df_chrono' not in st.session_state or 'q_diseno_decadal' not in st.session_state:
@@ -758,19 +719,25 @@ with tab3:
             with st.spinner("Simulando balance volumétrico y calculando optimización agronómica... 🌊"):
                 df_chrono = st.session_state['df_chrono'].copy()
                 q_diseno_decadal = st.session_state['q_diseno_decadal']
-                t_max = st.session_state['t_max']
+                t_max = st.session_state.get('t_max', 12)
                 area_cultivo_ha = st.session_state.get('area_total_ha', 0.5)
+                tipo_riego = st.session_state.get('tipo_riego', "Riego por goteo")
                 
-                # Geometría
-                area_tanque = math.pi * (radio_tanque ** 2)
-                v_max = area_tanque * altura_tanque
-                area_tejado_efectiva = (largo_tejado * ancho_tejado) * coef_escorrentia
-                area_tejado_fisica = largo_tejado * ancho_tejado
+                # ---------------------------------------------------------
+                # 1. GEOMETRÍA INICIAL (AQUÍ ENTRA EL IF/ELSE DEL TIPO DE RESERVORIO)
+                # ---------------------------------------------------------
+                if es_excavado:
+                    v_max = vol_max_sistema # Viene de la tabla batimétrica (arriba)
+                    area_tejado_efectiva = 0.0 # Se asume que no hay cosecha de techos para el reservorio
+                else:
+                    area_tanque = math.pi * (radio_tanque ** 2)
+                    v_max = area_tanque * altura_tanque
+                    area_tejado_efectiva = (largo_tejado * ancho_tejado) * coef_escorrentia
                 
                 dias_d = np.array([10,10,11, 10,10,8, 10,10,11, 10,10,10, 10,10,11, 10,10,10, 10,10,11, 10,10,11, 10,10,10, 10,10,11, 10,10,10, 10,10,11])
                 
                 resultados_simulacion = []
-                v_actual = v_max 
+                v_actual = v_max  # Inicia lleno
                 deficit_maximo_registrado = 0.0 
                 
                 for index, row in df_chrono.iterrows():
@@ -778,20 +745,30 @@ with tab3:
                     decada_idx = decada_año - 1 
                     dias, p_dec_mm, e_dec_mm = dias_d[decada_idx], row['Precipitacion'], row['Evaporacion']
                     
+                    # ---------------------------------------------------------
+                    # 2. ÁREA DINÁMICA DE EVAPORACIÓN/LLUVIA
+                    # ---------------------------------------------------------
+                    if es_excavado:
+                        # Evalúa el polinomio para sacar el área según el volumen que nos queda
+                        area_espejo_actual = func_area(v_actual) if v_actual > 0 else func_area(0)
+                    else:
+                        area_espejo_actual = area_tanque
+
+                    # ENTRADAS
                     e_cp = (caudal_concesion * 86400 * dias) / 1000.0
-                    e_ll = area_tanque * (p_dec_mm / 1000.0)
-                    e_es = area_tejado_efectiva * (p_dec_mm / 1000.0)
+                    e_ll = area_espejo_actual * (p_dec_mm / 1000.0) # Lluvia directa usa el área dinámica
+                    e_es = area_tejado_efectiva * (p_dec_mm / 1000.0) if not es_excavado else 0.0
                     
-                    # Asumiendo que estás dentro del bucle de décadas y tienes acceso a 'decada_idx'
+                    # SALIDAS
                     if tipo_riego == "Riego por goteo":
-                        # Lógica original para goteo
                         s_d = (q_diseno_decadal[decada_idx] * t_max * 3600 * dias) / 1000.0
                     else:
-                        # Lógica para aspersión: Caudal (L/s)
                         s_d = (q_diseno_decadal[decada_idx] * 86.4 * dias) 
-                    s_e = area_tanque * (e_dec_mm / 1000.0)
-                    s_i = s_e * 0.10
                     
+                    s_e = area_espejo_actual * (e_dec_mm / 1000.0) # Evaporación usa el área dinámica
+                    s_i = s_e * 0.10 # Asumes infiltración como 10% de evaporación
+                    
+                    # BALANCE
                     v_temp = v_actual + e_cp + e_ll + e_es - s_d - s_e - s_i
                     derramado, deficit_decada = 0.0, 0.0
                     
@@ -800,53 +777,126 @@ with tab3:
                     elif v_temp < 0:
                         v_final, deficit_decada, estado = 0.0, abs(v_temp), "Déficit Crítico ⚠️"
                         v_actual_matematico = v_actual + e_cp + e_ll + e_es - s_d - s_e - s_i
-                        if abs(v_actual_matematico) > deficit_maximo_registrado: deficit_maximo_registrado = abs(v_actual_matematico)
+                        if abs(v_actual_matematico) > deficit_maximo_registrado: 
+                            deficit_maximo_registrado = abs(v_actual_matematico)
                     else:
                         v_final, estado = v_temp, "Operación Normal"
                         
-                    altura_vaso = v_final / area_tanque if area_tanque > 0 else 0
+                    # ---------------------------------------------------------
+                    # 3. ALTURA DE LÁMINA FINAL DE LA DÉCADA
+                    # ---------------------------------------------------------
+                    if es_excavado:
+                        # Si la UI lo definió, interpolamos. (h_vals y v_vals se definieron al llenar la tabla)
+                        altura_vaso = np.interp(v_final, v_vals, h_vals) if v_final > 0 else 0
+                    else:
+                        altura_vaso = v_final / area_tanque if area_tanque > 0 else 0
                     
                     resultados_simulacion.append({
-                        'Año': año, 'Decada': decada_año, 'Altura Vaso (m)': altura_vaso, 'Volumen Inicial (m3)': v_actual,
-                        'Entrada Concesion (m3)': e_cp, 'Entrada Lluvia (m3)': e_ll, 'Entrada Escorrentia (m3)': e_es,
-                        'Salida Riego (m3)': s_d, 'Salida Evaporación (m3)': s_e, 'Salida Infiltración (m3)': s_i,
-                        'Volumen Final (m3)': v_final, 'Déficit Hídrico (m3)': deficit_decada, 'Volumen Derramado (m3)': derramado, 'Estado': estado
+                        'Año': año, 'Decada': decada_año, 'Altura Vaso (m)': round(altura_vaso, 2), 'Volumen Inicial (m3)': round(v_actual, 2),
+                        'Entrada Concesion (m3)': round(e_cp, 2), 'Entrada Lluvia (m3)': round(e_ll, 2), 'Entrada Escorrentia (m3)': round(e_es, 2),
+                        'Salida Riego (m3)': round(s_d, 2), 'Salida Evaporación (m3)': round(s_e, 2), 'Salida Infiltración (m3)': round(s_i, 2),
+                        'Volumen Final (m3)': round(v_final, 2), 'Déficit Hídrico (m3)': round(deficit_decada, 2), 'Volumen Derramado (m3)': round(derramado, 2), 'Estado': estado
                     })
                     v_actual = v_final
                 
                 df_simulacion = pd.DataFrame(resultados_simulacion)
+                st.session_state['df_simulacion_reservorio'] = df_simulacion # Lo guardamos para exportarlo al Word después
                 st.success("✅ Simulación de tránsito del reservorio finalizada.")
                 
-                # --- PLANITO ESQUEMÁTICO A ESCALA REAL ---
+                # Mostrar resultados rápido para el usuario
+                st.dataframe(df_simulacion)
+
+               # --- PLANITO ESQUEMÁTICO A ESCALA REAL ---
                 st.divider()
                 st.subheader("🗺️ Esquema Espacial del Proyecto (Vista en Planta)")
-                
-                area_cultivo_m2 = area_cultivo_ha * 10000
-                lado_cultivo = math.sqrt(area_cultivo_m2)
                 
                 import plotly.graph_objects as go
                 fig_esq = go.Figure()
 
-                fig_esq.add_shape(type="rect", x0=0, y0=0, x1=lado_cultivo, y1=lado_cultivo, line=dict(color="DarkOliveGreen", width=2), fillcolor="rgba(107,142,35,0.3)")
-                fig_esq.add_trace(go.Scatter(x=[None], y=[None], mode='markers', marker=dict(size=15, color="rgba(107,142,35,0.5)", symbol='square'), name=f"Área Riego ({area_cultivo_m2:,.0f} m²)"))
+                # --- 1. DEFINIR VARIABLES BASE PRIMERO ---
+                # Traemos el área del cultivo (Si no existe, asumimos 0.5 hectáreas por defecto)
+                area_cultivo_ha = st.session_state.get('area_total_ha', 0.5)
+                area_cultivo_m2 = area_cultivo_ha * 10000
+                lado_cultivo = math.sqrt(area_cultivo_m2)
+                margen = 5.0 # Margen de separación entre obras en metros
+                
+                # --- 2. DEFINIR DIMENSIONES DEL ALMACENAMIENTO ---
+                if es_excavado:
+                    # Calcular el área máxima evaluando el polinomio en el volumen máximo
+                    area_maxima = func_area(vol_max_sistema) if vol_max_sistema > 0 else 100.0
+                    
+                    # Asumimos una forma cuadrada para el espejo de agua máximo
+                    lado_reservorio = math.sqrt(area_maxima)
+                    distancia_centro = lado_reservorio / 2
+                    
+                    xc_tanque = lado_cultivo + margen + distancia_centro
+                    yc_tanque = margen + distancia_centro
+                    forma_dibujo = "rectangulo"
+                    
+                else:
+                    # Usar el radio del tanque australiano (con valor seguro por defecto)
+                    distancia_centro = locals().get('radio_tanque', 5.0)
+                    xc_tanque = lado_cultivo + margen + distancia_centro
+                    yc_tanque = margen + distancia_centro
+                    forma_dibujo = "circulo"
+                
+                # --- 3. DIBUJAR EL CULTIVO ---
+                fig_esq.add_shape(
+                    type="rect",
+                    x0=0, y0=0, x1=lado_cultivo, y1=lado_cultivo,
+                    line_color="DarkGreen", fillcolor="LightGreen", opacity=0.3
+                )
+                fig_esq.add_annotation(x=lado_cultivo/2, y=lado_cultivo/2, text=f"Área de Cultivo<br>({area_cultivo_ha} ha)", showarrow=False)
 
-                margen = max(lado_cultivo * 0.05, 2.0) 
-                xc_tanque = lado_cultivo + margen + radio_tanque
-                yc_tanque = radio_tanque
-                fig_esq.add_shape(type="circle", x0=xc_tanque-radio_tanque, y0=yc_tanque-radio_tanque, x1=xc_tanque+radio_tanque, y1=yc_tanque+radio_tanque, line=dict(color="MidnightBlue", width=2), fillcolor="rgba(65,105,225,0.5)")
-                fig_esq.add_trace(go.Scatter(x=[None], y=[None], mode='markers', marker=dict(size=15, color="rgba(65,105,225,0.5)", symbol='circle'), name=f"Reservorio ({area_tanque:,.0f} m²)"))
+                # --- 4. DIBUJAR EL ALMACENAMIENTO ---
+                if forma_dibujo == "circulo":
+                    fig_esq.add_shape(
+                        type="circle",
+                        x0=xc_tanque - distancia_centro, y0=yc_tanque - distancia_centro,
+                        x1=xc_tanque + distancia_centro, y1=yc_tanque + distancia_centro,
+                        line_color="DarkBlue", fillcolor="LightSkyBlue"
+                    )
+                    fig_esq.add_annotation(x=xc_tanque, y=yc_tanque, text="Tanque<br>Australiano", showarrow=False)
+                
+                elif forma_dibujo == "rectangulo":
+                    fig_esq.add_shape(
+                        type="rect",
+                        x0=xc_tanque - distancia_centro, y0=yc_tanque - distancia_centro,
+                        x1=xc_tanque + distancia_centro, y1=yc_tanque + distancia_centro,
+                        line_color="SaddleBrown", fillcolor="MediumTurquoise",
+                        opacity=0.8
+                    )
+                    fig_esq.add_annotation(x=xc_tanque, y=yc_tanque, text="Reservorio<br>Excavado", showarrow=False)
+
+                # --- 5. DIBUJAR COSECHA DE AGUAS LLUVIAS (Si aplica) ---
+                area_tejado_fisica = locals().get('area_tejado_fisica', 0)
+                habilitar_cosecha = locals().get('habilitar_cosecha', False)
 
                 if habilitar_cosecha and area_tejado_fisica > 0:
-                    y_tej_base = yc_tanque + radio_tanque + margen
-                    fig_esq.add_shape(type="rect", x0=lado_cultivo + margen, y0=y_tej_base, x1=lado_cultivo + margen + largo_tejado, y1=y_tej_base + ancho_tejado, line=dict(color="DimGray", width=2), fillcolor="rgba(169,169,169,0.6)")
-                    fig_esq.add_trace(go.Scatter(x=[None], y=[None], mode='markers', marker=dict(size=15, color="rgba(169,169,169,0.6)", symbol='square'), name=f"Ramada ({area_tejado_fisica:,.0f} m²)"))
+                    largo_tejado = locals().get('largo_tejado', 10)
+                    ancho_tejado = locals().get('ancho_tejado', 10)
+                    y_tej_base = yc_tanque + distancia_centro + margen
+                    
+                    fig_esq.add_shape(
+                        type="rect", 
+                        x0=lado_cultivo + margen, y0=y_tej_base, 
+                        x1=lado_cultivo + margen + largo_tejado, y1=y_tej_base + ancho_tejado, 
+                        line=dict(color="DimGray", width=2), fillcolor="rgba(169,169,169,0.6)"
+                    )
+                    fig_esq.add_annotation(
+                        x=lado_cultivo + margen + (largo_tejado/2), 
+                        y=y_tej_base + (ancho_tejado/2), 
+                        text=f"Cubierta<br>({area_tejado_fisica:,.0f} m²)", showarrow=False
+                    )
 
+                # --- 6. CONFIGURACIÓN Y RENDERIZADO DEL GRÁFICO ---
                 fig_esq.update_layout(
                     xaxis=dict(scaleanchor="y", scaleratio=1, showgrid=False, zeroline=False, visible=False),
                     yaxis=dict(showgrid=False, zeroline=False, visible=False),
                     plot_bgcolor="white", margin=dict(l=0, r=0, t=30, b=0),
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5)
+                    title_text="Distribución Espacial a Escala Real", title_x=0.5
                 )
+                
                 st.plotly_chart(fig_esq, use_container_width=True)
                 st.caption("🔍 *Nota: Este plano geométrico está renderizado a escala real (1:1). Ayuda a dimensionar la magnitud de las obras civiles frente a la extensión agrícola.*")
 
@@ -855,9 +905,22 @@ with tab3:
                 st.subheader("🛠️ Diagnóstico de Resiliencia y Auto-Dimensionamiento")
                 
                 col_diag1, col_diag2 = st.columns(2)
+                
                 with col_diag1:
-                    area_tejado_texto = f"{area_tejado_fisica:.2f} m²" if habilitar_cosecha else "No implementada"
-                    st.info(f"**Diseño Actual Analizado:**\n* Radio Tanque: {radio_tanque} m\n* Volumen Tanque: {v_max:.2f} m³\n* Área Cultivo: {area_cultivo_ha:.2f} Ha\n* Área Ramada: {area_tejado_texto}")
+                    # 1. Resumen seguro (evita el NameError de radio_tanque)
+                    if es_excavado:
+                        texto_almacenamiento = f"* Tipo: Reservorio Excavado\n* Volumen Máximo: {v_max:.2f} m³"
+                    else:
+                        radio_seguro = locals().get('radio_tanque', 0.0)
+                        texto_almacenamiento = f"* Tipo: Tanque Australiano\n* Radio: {radio_seguro} m\n* Volumen: {v_max:.2f} m³"
+
+                    # Validar si existe cosecha de techos
+                    habilitar_cosecha = locals().get('habilitar_cosecha', False)
+                    area_tejado_fisica = locals().get('area_tejado_fisica', 0.0)
+                    area_tejado_texto = f"{area_tejado_fisica:.2f} m²" if habilitar_cosecha and area_tejado_fisica > 0 else "No implementada"
+                    area_cultivo_ha = st.session_state.get('area_total_ha', 0.5)
+
+                    st.info(f"**Diseño Actual Analizado:**\n{texto_almacenamiento}\n* Área Cultivo: {area_cultivo_ha:.2f} Ha\n* Área Ramada: {area_tejado_texto}")
                 
                 with col_diag2:
                     if deficit_maximo_registrado > 0:
@@ -865,13 +928,12 @@ with tab3:
                         
                         # 1. Ajuste Estructural
                         volumen_ideal = v_max + deficit_maximo_registrado
-                        radio_ideal = math.sqrt(volumen_ideal / (math.pi * altura_tanque))
                         
                         # 2. Ajuste Agronómico (Búsqueda Binaria del Área Óptima)
                         low, high = 0.001, area_cultivo_ha
                         area_optima = 0.0
                         
-                        for _ in range(20): # 20 iteraciones son perfectas para precisión de 0.001 Ha
+                        for _ in range(20): # 20 iteraciones (precisión de 0.001 Ha)
                             mid = (low + high) / 2
                             factor_area = mid / area_cultivo_ha
                             v_act_sim = v_max
@@ -881,12 +943,25 @@ with tab3:
                                 d_idx = int(row_s['Decada_Año']) - 1
                                 p_mm, e_mm = row_s['Precipitacion'], row_s['Evaporacion']
                                 
-                                e_cp_s = (caudal_concesion * 86400 * dias_d[d_idx]) / 1000.0
-                                e_ll_s = area_tanque * (p_mm / 1000.0)
-                                e_es_s = area_tejado_efectiva * (p_mm / 1000.0)
+                                # --- Lógica dual: Excavado vs Tanque ---
+                                if es_excavado:
+                                    area_sim = func_area(v_act_sim) if v_act_sim > 0 else func_area(0)
+                                    e_es_s = 0.0 # No se asume cosecha de techos para reservorio excavado
+                                else:
+                                    area_sim = locals().get('area_tanque', 0.0)
+                                    area_tej_ef = locals().get('area_tejado_efectiva', 0.0)
+                                    e_es_s = area_tej_ef * (p_mm / 1000.0)
                                 
-                                s_d_s = (q_diseno_decadal[d_idx] * factor_area * t_max * 3600 * dias_d[d_idx]) / 1000.0
-                                s_e_s = area_tanque * (e_mm / 1000.0)
+                                e_cp_s = (caudal_concesion * 86400 * dias_d[d_idx]) / 1000.0
+                                e_ll_s = area_sim * (p_mm / 1000.0)
+                                
+                                # Salida de riego ajustada por el factor de iteración
+                                if tipo_riego == "Riego por goteo":
+                                    s_d_s = (q_diseno_decadal[d_idx] * factor_area * t_max * 3600 * dias_d[d_idx]) / 1000.0
+                                else:
+                                    s_d_s = (q_diseno_decadal[d_idx] * factor_area * 86.4 * dias_d[d_idx])
+                                
+                                s_e_s = area_sim * (e_mm / 1000.0)
                                 s_i_s = s_e_s * 0.10
                                 
                                 v_temp_s = v_act_sim + e_cp_s + e_ll_s + e_es_s - s_d_s - s_e_s - s_i_s
@@ -897,16 +972,22 @@ with tab3:
                                 v_act_sim = v_max if v_temp_s > v_max else v_temp_s
                                 
                             if fallo_sim:
-                                high = mid # El área probada sigue siendo muy grande
+                                high = mid # El área sigue siendo muy grande
                             else:
-                                low = mid  # El área soporta bien, intentemos con un poco más
+                                low = mid  # El área soporta bien, intentemos un poco más
                                 area_optima = mid
                         
-                        # Mostrar Soluciones
-                        if radio_ideal > 20.0:
-                            st.warning(f"🏗️ **Opción 1 (Estructural):** Subir el radio a **{radio_ideal:.2f} m** es inviable (>20m). Te recomendamos aumentar el área de la ramada.")
+                        # Mostrar Soluciones (Diferenciadas por infraestructura)
+                        if es_excavado:
+                            st.info(f"🏗️ **Opción 1 (Estructural):** Se requiere rediseñar la topografía/batimetría del reservorio para alcanzar un volumen útil de al menos **{volumen_ideal:.2f} m³**.")
                         else:
-                            st.info(f"🏗️ **Opción 1 (Estructural):** Incrementa el radio del tanque a **{radio_ideal:.2f} metros** para mantener las {area_cultivo_ha:.2f} Ha actuales de cultivo.")
+                            altura_segura = locals().get('altura_tanque', 1.5)
+                            radio_ideal = math.sqrt(volumen_ideal / (math.pi * altura_segura))
+                            
+                            if radio_ideal > 20.0:
+                                st.warning(f"🏗️ **Opción 1 (Estructural):** Subir el radio a **{radio_ideal:.2f} m** es inviable (>20m). Te recomendamos aumentar el área de la ramada.")
+                            else:
+                                st.info(f"🏗️ **Opción 1 (Estructural):** Incrementa el radio del tanque a **{radio_ideal:.2f} metros** para mantener las {area_cultivo_ha:.2f} Ha actuales de cultivo.")
                             
                         if area_optima > 0.01:
                             st.success(f"🌱 **Opción 2 (Agronómica):** Si no puedes agrandar el reservorio, debes reducir el área de cultivo a máximo **{area_optima:.3f} Ha** ({(area_optima*10000):.0f} m²) para garantizar agua todo el año.")
@@ -914,122 +995,52 @@ with tab3:
                             st.error(f"🌱 **Opción 2 (Agronómica):** El reservorio propuesto es tan pequeño que no puede sostener ni 0.01 Ha. ¡Necesitas rediseñar urgentemente o buscar una concesión de agua!")
                     else:
                         st.success("🏆 **DISEÑO ÓPTIMO:** El reservorio propuesto es resiliente y no se vació durante toda la serie climática analizada.")
-
-                # --- GRÁFICAS DEL COMPORTAMIENTO ---
-                st.divider()
-                st.subheader("📈 Evolución del Almacenamiento")
-                df_simulacion['Periodo'] = df_simulacion['Año'].astype(str) + " - D" + df_simulacion['Decada'].astype(str).str.zfill(2)
                 
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(x=df_simulacion['Periodo'], y=df_simulacion['Volumen Final (m3)'], mode='lines', fill='tozeroy', name='Volumen Almacenado', line=dict(color='#1f77b4')))
-                fig.add_trace(go.Scatter(x=df_simulacion['Periodo'], y=[v_max]*len(df_simulacion), mode='lines', name='Capacidad Máxima', line=dict(color='red', dash='dash')))
-                
-                fig.update_layout(title="Tránsito del Embalse a lo Largo de los Años", xaxis_title="Periodo (Año - Década)", yaxis_title="Volumen (m³)", hovermode="x unified")
-                st.plotly_chart(fig, use_container_width=True)
-
-                # --- MATRIZ DE RESULTADOS ---
-                st.divider()
-                st.subheader("📋 Matriz de Tránsito del Reservorio")
-                
-                def color_estado(val):
-                    if "Déficit" in val: return 'background-color: #ff4b4b; color: white;'
-                    elif "Derrama" in val: return 'background-color: #1f77b4; color: white;'
-                    return 'background-color: #d4edda; color: black;'
-                
-                with st.expander("Ver Matriz Completa de Simulación", expanded=True):
-                    st.dataframe(df_simulacion.style.map(color_estado, subset=['Estado']).format({
-                        'Altura Vaso (m)': '{:.2f}', 'Volumen Inicial (m3)': '{:.2f}', 'Entrada Concesion (m3)': '{:.2f}', 
-                        'Entrada Lluvia (m3)': '{:.2f}', 'Entrada Escorrentia (m3)': '{:.2f}', 'Salida Riego (m3)': '{:.2f}', 
-                        'Salida Evaporación (m3)': '{:.2f}', 'Salida Infiltración (m3)': '{:.2f}', 'Volumen Final (m3)': '{:.2f}', 
-                        'Déficit Hídrico (m3)': '{:.2f}', 'Volumen Derramado (m3)': '{:.2f}'
-                    }))
-
-                csv_sim = df_simulacion.round(3).to_csv(index=False, sep=";")
-                st.download_button("📥 Descargar Matriz de Simulación (CSV)", data=csv_sim, file_name="Simulacion_Reservorio.csv", mime="text/csv", key="btn_down_sim")
 
 
+# --- PESTAÑA 4: GENERACIÓN DE MEMORIA DE CÁLCULO ---
 
-# --- PESTAÑA 6: GENERACIÓN DE MEMORIA DE CÁLCULO ---
 with tab4:
-    st.subheader("📄 Generación de Memoria de Cálculo")
-    st.markdown("Consolida todos los parámetros climáticos, agronómicos e hidráulicos calculados en las pestañas anteriores en un documento formal de Word.")
-
-    # Definimos la función generadora de Word aquí mismo para mantener el orden
-    def generar_memoria_calculo():
-        # 1. Crear documento en blanco
-        doc = Document()
-        
-        # 2. Título y Encabezado
-        doc.add_heading('Memoria de Cálculo: Sistema de Riego', 0)
-        doc.add_paragraph('Generado automáticamente por HidroApp ADR')
-        
-        # 3. Sección de Parámetros de Ubicación y Clima
-        doc.add_heading('1. Parámetros de Ubicación y Climatología', level=1)
-        lat = st.session_state.get('latitud', 'N/A') # Revisa si tu variable se llama lat_nasa_t1
-        lon = st.session_state.get('longitud', 'N/A')
-        doc.add_paragraph(f'Coordenadas del proyecto: Latitud {lat}, Longitud {lon}')
-        doc.add_paragraph('Los datos climáticos fueron extraídos de la base de datos de NASA POWER. La precipitación confiable se calculó utilizando el Percentil 25 (probabilidad de excedencia del 75%).')
-
-        # 4. Insertar Gráficos
-        if st.session_state.get('imagen_clima_bytes') is not None:
-            # Ya no usamos pio.to_image aquí, simplemente llamamos la foto guardada
-            img_buffer = io.BytesIO(st.session_state['imagen_clima_bytes'])
-            doc.add_picture(img_buffer, width=Inches(6.0))
-            doc.add_paragraph('Figura 1. Comportamiento hídrico decadal histórico.')
-        else:
-            doc.add_paragraph('(Aviso: La gráfica climática no pudo ser procesada como imagen estática para este documento).')
-
-        # 5. Sección de Diseño Agronómico e Hidráulico
-        doc.add_heading('2. Diseño Agronómico y Requerimientos de Caudal', level=1)
-        tipo = st.session_state.get('tipo_riego', 'No definido')
-        area = st.session_state.get('area_total_ha', 'N/A')
-        doc.add_paragraph(f'Tipo de sistema seleccionado: {tipo}')
-        doc.add_paragraph(f'Área total del proyecto: {area} hectáreas.')
-        
-        # --- AÑADIMOS NUEVAS SECCIONES BASADAS EN LOS CÁLCULOS ---
-        doc.add_heading('3. Resultados Hidráulicos', level=1)
-        
-        # Verificamos si la matriz de diseño se guardó en la memoria
-        if 'q_diseno' in st.session_state:
-            q_matriz = st.session_state['q_diseno']
+    st.header("Generación de Memorias de Cálculo")
+    col_a, col_b = st.columns(2)
+    
+    with col_a:
+        if st.button("Generar Anexo 3 (Hidrología)"):
+            # 1. Recuperar los datos de la sesión guardados en las pestañas previas
+            df_clima = st.session_state.get('df_chrono', None)
+            df_sim = st.session_state.get('df_simulacion_reservorio', None)
             
-            # Sumar todos los caudales de los sectores (asumiendo que están en la matriz)
-            caudal_maximo_total = q_matriz.sum(axis=0).max() # Caudal pico en la peor década
-            
-            doc.add_paragraph('El sistema fue evaluado para 36 décadas, proyectando el requerimiento a 24 horas continuas para determinar la capacidad de la fuente.')
-            
-            # Escribir el caudal máximo en negrita
-            p = doc.add_paragraph()
-            p.add_run('Caudal de diseño máximo requerido (Estimado): ').bold = True
-            p.add_run(f'{caudal_maximo_total:.2f} Litros/segundo.')
-        else:
-            doc.add_paragraph('No se encontraron resultados de caudal en la memoria. Asegúrese de calcular el balance hídrico.')
-            
-        # 6. Guardar en un buffer de memoria
-        buffer_salida = io.BytesIO()
-        doc.save(buffer_salida)
-        buffer_salida.seek(0)
-        
-        return buffer_salida
+            # (Opcional) Guardar en Session State el tipo de reservorio y volumen maximo en la Pestaña 3 
+            # para llamarlos aquí. Si no los tienes, puedes poner valores por defecto:
+            tipo_almacenamiento = st.session_state.get('tipo_almacenamiento_elegido', "Reservorio Excavado")
+            vol_maximo = st.session_state.get('volumen_maximo_sistema', 0.0)
 
-    # --- FIN DE LA FUNCIÓN ---
-    # El código a continuación vuelve a alinearse a la izquierda (fuera del def, dentro del with tab6)
-
-    # Botón para generar y descargar
-    if st.button("Generar Informe Técnico en Word", type="primary"):
-        with st.spinner("Redactando memoria de cálculo y procesando gráficas... ✍️"):
-            try:
-                # Llamamos a la función
-                archivo_docx = generar_memoria_calculo()
+            # 2. Verificar que se haya hecho la simulación
+            if df_sim is None:
+                st.error("⚠️ Debes ir a la Pestaña 3 y dar clic en 'Simular Tránsito del Reservorio' antes de generar este documento.")
+            else:
+                # 3. Crear documento y descargar
+                doc_h = crear_memoria_hidrologia(
+                    datos_clima=df_clima, 
+                    coordenadas=None, 
+                    df_simulacion=df_sim, 
+                    tipo_almacenamiento=tipo_almacenamiento, 
+                    vol_max=vol_maximo
+                )
                 
-                # Mostramos el botón de descarga real
-                st.success("✅ Informe generado exitosamente.")
+                buffer = io.BytesIO()
+                doc_h.save(buffer)
                 st.download_button(
-                    label="📥 Descargar Memoria_Calculo.docx",
-                    data=archivo_docx,
-                    file_name="Memoria_Calculo_HidroApp.docx",
+                    label="📥 Descargar Anexo 3 (.docx)", 
+                    data=buffer.getvalue(), 
+                    file_name="Anexo_3_Hidrologia_ADR.docx",
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                 )
-            except Exception as e:
-                st.error(f"Hubo un error al generar el documento: {e}")
-                st.info("Asegúrate de haber calculado las pestañas anteriores primero.")
+
+    with col_b:
+        if st.button("Generar Memoria de Demandas"):
+            doc_d = crear_memoria_demandas(None)
+            buffer = io.BytesIO()
+            doc_d.save(buffer)
+            st.download_button("Descargar Memoria Demandas", buffer.getvalue(), "Memoria_Demandas_Riego.docx")
+

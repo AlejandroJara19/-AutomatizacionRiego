@@ -1037,6 +1037,44 @@ with tab3:
                 # Mostrar resultados rápido para el usuario
                 st.dataframe(df_simulacion)
 
+                # --- GRÁFICA DE LA SIMULACIÓN DEL RESERVORIO ---
+                st.divider()
+                st.subheader("📈 Comportamiento del Volumen Almacenado")
+                import plotly.express as px
+                
+                # Crear una columna de tiempo continua (Ej: "2018 - D1")
+                df_simulacion['Periodo'] = df_simulacion['Año'].astype(str) + " - D" + df_simulacion['Decada'].astype(str)
+                
+                fig_sim = px.area(
+                    df_simulacion, 
+                    x='Periodo', 
+                    y='Volumen Final (m3)',
+                    title="Nivel del Reservorio frente a la Demanda Histórica",
+                    color_discrete_sequence=['#1f77b4']
+                )
+                
+                # Agregar línea roja punteada para la capacidad máxima
+                fig_sim.add_hline(
+                    y=v_max, 
+                    line_dash="dash", 
+                    line_color="red", 
+                    annotation_text=f"Capacidad Máxima ({v_max:.1f} m³)", 
+                    annotation_position="top right"
+                )
+                
+                # Resaltar la zona de déficit (por debajo de 0 si el modelo lo permitiera matemáticamente, 
+                # aunque lo topamos a 0, si llega a 0 es peligro de quiebre)
+                fig_sim.update_layout(
+                    xaxis_title="Período Evaluado (Año - Década)",
+                    yaxis_title="Volumen Útil Almacenado (m³)",
+                    hovermode="x unified",
+                    plot_bgcolor="white"
+                )
+                fig_sim.update_xaxes(showgrid=True, gridwidth=1, gridcolor='LightGray')
+                fig_sim.update_yaxes(showgrid=True, gridwidth=1, gridcolor='LightGray')
+                
+                st.plotly_chart(fig_sim, use_container_width=True)
+
                # --- PLANITO ESQUEMÁTICO A ESCALA REAL ---
                 st.divider()
                 st.subheader("🗺️ Esquema Espacial del Proyecto (Vista en Planta)")
